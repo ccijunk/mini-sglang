@@ -15,6 +15,12 @@ class DisabledTqdm(tqdm):
 
 
 def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
+    from .nano_config import is_nano_model
+
+    if is_nano_model(model_path):  # nano sidecar: C1 vocab.json itos (T4c)
+        from ..tokenizer.nano_tokenizer import CharTokenizer
+
+        return CharTokenizer.from_model_path(model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     # Some Mistral models store chat_template in a separate JSON file
     if not getattr(tokenizer, "chat_template", None):
@@ -28,12 +34,25 @@ def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
 
 
 @functools.cache
+def _load_nano_config(model_path: str) -> Any:
+    from .nano_config import load_nano_hf_config
+
+    return load_nano_hf_config(model_path)
+
+
+@functools.cache
 def _load_hf_config(model_path: str) -> Any:
+    from .nano_config import is_nano_model
+
+    if is_nano_model(model_path):  # nano sidecar: NanoConfig field names (T4c)
+        return _load_nano_config(model_path)
     return AutoConfig.from_pretrained(model_path)
 
 
 def cached_load_hf_config(model_path: str) -> PretrainedConfig:
     config = _load_hf_config(model_path)
+    if not hasattr(config, "to_dict"):  # nano shim: SimpleNamespace, already HF-attr-shaped
+        return config
     return type(config)(**config.to_dict())
 
 

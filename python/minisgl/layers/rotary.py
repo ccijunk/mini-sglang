@@ -30,7 +30,8 @@ class RotaryEmbedding(StateLessOP):
         sin = freqs.sin()
         # buffer, so don't load/save
         self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
-        assert self.head_size in [64, 128, 256, 512]
+        # 32 added for the nano char model (C1 head_dim=32); flashinfer rope JIT compiles for it (T4c E-B2)
+        assert self.head_size in [32, 64, 128, 256, 512]
 
         from flashinfer import apply_rope_with_cos_sin_cache_inplace
 

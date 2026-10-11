@@ -1,72 +1,51 @@
-ARG CUDA_VERSION=12.8.1
-ARG UBUNTU_VERSION=24.04
-ARG PYTHON_VERSION=3.12
+# L2 image: nano-stack/engine:sglang (t4b, replaces upstream Dockerfile — t4 §6.1)
+#
+# Build context = STACK ROOT (C4 R4):   docker build -f mini-sglang/Dockerfile -t nano-stack/engine:sglang .
+# Base singleton (C4): upstream nvidia/cuda:12.8.1-devel + uv venv rejected.
+#
+# Compiler toolchain five-piece (t4a spike verdict §3): pip nvcc wheel is NOT a
+# toolkit — crt/ headers + nvvm/ (cicc) come from NVIDIA apt debs pinned to the
+# same 13.0.48-1 as the nvcc wheel; libcuda stub resolves at runtime via the
+# nvidia container runtime (dangling symlink at build time is intentional).
+FROM nano-stack/base:torch-cu13-py312
+ARG PIP_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG NVIDIA_REPO=https://developer.download.nvidia.cn/compute/cuda/repos/ubuntu2404/x86_64
 
-# Build stage
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
-
-ARG PYTHON_VERSION
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python${PYTHON_VERSION} \
-    python${PYTHON_VERSION}-dev \
-    python${PYTHON_VERSION}-venv \
-    python3-pip \
-    curl \
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends g++ curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv package manager
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:${PATH}"
+# crt/ + nvvm/ extraction (wheel flattens crt into include/ top-level but wrappers
+# still #include "crt/*.h"; CUDA 13 splits nvcc and nvvm into two debs)
+RUN curl -fsSL ${NVIDIA_REPO}/cuda-crt-13-0_13.0.48-1_amd64.deb -o /tmp/crt.deb \
+ && curl -fsSL ${NVIDIA_REPO}/libnvvm-13-0_13.0.48-1_amd64.deb -o /tmp/nvvm.deb \
+ && dpkg-deb -x /tmp/crt.deb /tmp/x && dpkg-deb -x /tmp/nvvm.deb /tmp/y \
+ && cp -r /tmp/x/usr/local/cuda-13.0/targets/x86_64-linux/include/crt /opt/crt \
+ && cp -r /tmp/y/usr/local/cuda-13.0/nvvm /opt/nvvm \
+ && rm -rf /tmp/x /tmp/y /tmp/crt.deb /tmp/nvvm.deb
 
-WORKDIR /app
+RUN pip install --break-system-packages --index-url ${PIP_INDEX} \
+    apache-tvm-ffi==0.1.14.post1 pyzmq msgpack msgspec tqdm ninja \
+    flashinfer-python==0.7.0.post1 torch-c-dlpack-ext==0.1.5 \
+    "transformers>=4.56.0,<=4.57.3" nvidia-cuda-nvcc==13.0.48
 
-# Copy all source files (editable install requires source to exist)
-COPY pyproject.toml ./
-COPY python/ ./python/
+# C2 server deps (t4d): FastAPI frontend + prometheus /metrics + interactive shell
+RUN pip install --break-system-packages --index-url ${PIP_INDEX} \
+    fastapi "uvicorn[standard]" prometheus_client prompt_toolkit
 
-# Create venv and install dependencies
-RUN uv venv --python=python${PYTHON_VERSION} /app/.venv \
-    && . /app/.venv/bin/activate \
-    && uv pip install -e . \
-    && uv pip install torch-c-dlpack-ext
+# synthesize CUDA_HOME layout + dev-symlink names the wheel omits
+RUN NV=/usr/local/lib/python3.12/dist-packages/nvidia/cu13 \
+ && cp -r /opt/crt "$NV/include/crt" && cp -r /opt/nvvm "$NV/nvvm" \
+ && ln -s libcudart.so.13 "$NV/lib/libcudart.so" \
+ && ln -s "$NV/lib" "$NV/lib64" \
+ && rm -f /usr/local/cuda && ln -s "$NV" /usr/local/cuda \
+ && rm -rf /opt/crt /opt/nvvm \
+ && mkdir -p "$NV/lib/stubs" \
+ && ln -s /usr/lib/x86_64-linux-gnu/libcuda.so.1 "$NV/lib/stubs/libcuda.so"
 
-# Runtime stage
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS runtime
-
-ARG PYTHON_VERSION
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python${PYTHON_VERSION} \
-    python${PYTHON_VERSION}-venv \
-    && rm -rf /var/lib/apt/lists/*
-
-# Create non-root user
-RUN useradd --create-home --shell /bin/bash --uid 1001 minisgl
-
-# Copy application from builder
-COPY --from=builder --chown=minisgl:minisgl /app /app
-
-# Create cache directories
-RUN mkdir -p /app/.cache/huggingface /app/.cache/tvm-ffi /app/.cache/flashinfer \
-    && chown -R minisgl:minisgl /app/.cache
-
-WORKDIR /app
-
-# Environment configuration
 ENV CUDA_HOME=/usr/local/cuda
-ENV PATH="${CUDA_HOME}/bin:/app/.venv/bin:${PATH}"
-ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
-ENV PYTHONUNBUFFERED=1
 
-# Set up cache directories
-ENV HF_HOME=/app/.cache/huggingface
-ENV TVM_FFI_CACHE_DIR=/app/.cache/tvm-ffi
-ENV FLASHINFER_WORKSPACE_BASE=/app/.cache/flashinfer
+# JIT cache singleton (C5: large deps shared via host .cache/ mount)
+ENV TVM_FFI_CACHE_DIR=/opt/cache/tvm-ffi FLASHINFER_WORKSPACE_BASE=/opt/cache/flashinfer
 
-USER minisgl
-
-EXPOSE 1919
-
-ENTRYPOINT ["python", "-m", "minisgl"]
-CMD ["--help"]
+COPY mini-sglang/ /opt/mini-sglang/
+RUN pip install --break-system-packages --no-deps /opt/mini-sglang
