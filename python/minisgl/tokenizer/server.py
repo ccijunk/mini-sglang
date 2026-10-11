@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
-from typing import List
+from typing import Dict, List
 
 import torch
 from minisgl.message import (
@@ -14,6 +14,8 @@ from minisgl.message import (
     BatchFrontendMsg,
     BatchTokenizerMsg,
     DetokenizeMsg,
+    GaugeMsg,
+    GaugeReply,
     TokenizeMsg,
     UserMsg,
     UserReply,
@@ -52,6 +54,10 @@ def tokenize_worker(
 
     tokenize_manager = TokenizeManager(tokenizer)
     detokenize_manager = DetokenizeManager(tokenizer)
+    # C2 usage accounting (t4 §3 T4d): the tokenizer process sees both the
+    # prompt length (tokenize branch) and every generated token (detokenize branch)
+    prompt_lens: Dict[int, int] = {}
+    compl_lens: Dict[int, int] = {}
 
     if ack_queue is not None:
         ack_queue.put(f"Tokenize server {tokenizer_id} is ready")
@@ -67,8 +73,22 @@ def tokenize_worker(
             detokenize_msg = [m for m in pending_msg if isinstance(m, DetokenizeMsg)]
             tokenize_msg = [m for m in pending_msg if isinstance(m, TokenizeMsg)]
             abort_msg = [m for m in pending_msg if isinstance(m, AbortMsg)]
-            assert len(detokenize_msg) + len(tokenize_msg) + len(abort_msg) == len(pending_msg)
+            gauge_msg = [m for m in pending_msg if isinstance(m, GaugeMsg)]
+            assert (
+                len(detokenize_msg) + len(tokenize_msg) + len(abort_msg) + len(gauge_msg)
+                == len(pending_msg)
+            )
+            for m in gauge_msg:
+                send_frontend.put(
+                    GaugeReply(
+                        queue_depth=m.queue_depth,
+                        running_batch=m.running_batch,
+                        kv_utilization=m.kv_utilization,
+                    )
+                )
             if len(detokenize_msg) > 0:
+                for m in detokenize_msg:
+                    compl_lens[m.uid] = compl_lens.get(m.uid, 0) + 1
                 replies = detokenize_manager.detokenize(detokenize_msg)
                 batch_output = BatchFrontendMsg(
                     data=[
@@ -76,6 +96,16 @@ def tokenize_worker(
                             uid=msg.uid,
                             incremental_output=reply,
                             finished=msg.finished,
+                            prompt_tokens=(
+                                prompt_lens.pop(msg.uid, 0)
+                                if msg.finished
+                                else prompt_lens.get(msg.uid, 0)
+                            ),
+                            completion_tokens=(
+                                compl_lens.pop(msg.uid, 0)
+                                if msg.finished
+                                else compl_lens.get(msg.uid, 0)
+                            ),
                         )
                         for msg, reply in zip(detokenize_msg, replies, strict=True)
                     ]
@@ -86,6 +116,8 @@ def tokenize_worker(
 
             if len(tokenize_msg) > 0:
                 tensors = tokenize_manager.tokenize(tokenize_msg)
+                for msg, t in zip(tokenize_msg, tensors, strict=True):
+                    prompt_lens[msg.uid] = int(t.numel())
                 batch_output = BatchBackendMsg(
                     data=[
                         UserMsg(

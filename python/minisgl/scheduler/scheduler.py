@@ -11,6 +11,7 @@ from minisgl.message import (
     BatchBackendMsg,
     DetokenizeMsg,
     ExitMsg,
+    GaugeMsg,
     UserMsg,
 )
 from minisgl.utils import init_logger, load_tokenizer
@@ -150,7 +151,14 @@ class Scheduler(SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
-                finished = not req.can_decode
+                # overlap scheduling runs complete_one at launch, so device_len is
+                # one forward ahead of the output being processed here — the budget
+                # check (can_decode) would fire finished one token early in server
+                # mode (t4 §6: fork-base defect, invisible to offline normal_loop).
+                # Finish on the host-side generated count instead; identical in
+                # normal mode, and over-scheduling is already prevented by the
+                # filter_reqs budget check at launch (_forward).
+                finished = len(req.input_ids) >= req.max_device_len
                 if not req.sampling_params.ignore_eos:
                     finished |= next_token == self.eos_token_id
                 reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
@@ -164,6 +172,20 @@ class Scheduler(SchedulerIOMixin):
                     self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished_reqs
+        # gauge snapshot piggybacked on the result chain every step (t4 §3 T4d;
+        # offline mode keeps the raw DetokenizeMsg stream for the test driver)
+        if not self.offline_mode:
+            cm = self.cache_manager
+            total = cm.num_pages * cm.page_size
+            free = len(cm.free_slots) * cm.page_size
+            reply.append(
+                GaugeMsg(
+                    queue_depth=len(self.prefill_manager.pending_list),
+                    running_batch=len(self.decode_manager.running_reqs),
+                    # occupancy = live + radix-cached (evictable) pages, T3/T5 semantics
+                    kv_utilization=min(1.0, max(0.0, 1.0 - free / total)),
+                )
+            )
         self.send_result(reply)
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
@@ -186,6 +208,9 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            if msg.sampling_params.seed is not None:
+                # process-level seed at admission (t4 §6.6, T3 §6.3 analog)
+                torch.manual_seed(msg.sampling_params.seed)
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)

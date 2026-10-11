@@ -19,6 +19,8 @@ class SamplingParams:
     top_p: float = 1.0
     ignore_eos: bool = False
     max_tokens: int = 1024
+    # process-level seed applied at scheduler admission (t4 §6.6; no per-request replay under concurrency)
+    seed: int | None = None
 
     @property
     def is_greedy(self) -> bool:

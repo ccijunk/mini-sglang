@@ -41,3 +41,12 @@ class TokenizeMsg(BaseTokenizerMsg):
 @dataclass
 class AbortMsg(BaseTokenizerMsg):
     uid: int
+
+
+@dataclass
+class GaugeMsg(BaseTokenizerMsg):
+    """Scheduler gauge snapshot piggybacked on the result chain (t4 §3 T4d)."""
+
+    queue_depth: int
+    running_batch: int
+    kv_utilization: float

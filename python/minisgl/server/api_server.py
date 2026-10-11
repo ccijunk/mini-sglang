@@ -2,14 +2,26 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Literal, Tuple
+from time import perf_counter
+from typing import Any, Callable, Dict, List, Literal, Tuple
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    REGISTRY,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
 from minisgl.core import SamplingParams
 from minisgl.env import ENV
 from minisgl.message import (
@@ -17,13 +29,14 @@ from minisgl.message import (
     BaseFrontendMsg,
     BaseTokenizerMsg,
     BatchFrontendMsg,
+    GaugeReply,
     TokenizeMsg,
     UserReply,
 )
-from minisgl.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
+from minisgl.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, cached_load_hf_config, init_logger, load_tokenizer
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.background import BackgroundTask
 
 from .args import ServerArgs
@@ -31,6 +44,32 @@ from .args import ServerArgs
 logger = init_logger(__name__, "FrontendAPI")
 
 _GLOBAL_STATE = None
+
+# C2 §metrics: names/types/labels are contract (doc/contracts/server_api.md; base labels engine + model)
+ENGINE_LABEL = "mini-sglang"
+REQUEST_TOTAL = Counter("nano_request_total", "C2 request count", ["engine", "model", "status"])
+PROMPT_TOKENS = Counter("nano_request_prompt_tokens", "C2 prompt token throughput", ["engine", "model"])
+COMPLETION_TOKENS = Counter("nano_request_completion_tokens", "C2 completion token throughput", ["engine", "model"])
+TTFT = Histogram("nano_ttft_seconds", "C2 time to first token", ["engine", "model"])
+TPOT = Histogram("nano_tpot_seconds", "C2 time per output token", ["engine", "model"])
+QUEUE_DEPTH = Gauge("nano_queue_depth", "C2 queued requests", ["engine", "model"])
+RUNNING_BATCH = Gauge("nano_running_batch", "C2 requests in running batch", ["engine", "model"])
+KV_UTIL = Gauge("nano_kv_cache_utilization", "C2 KV pool occupancy 0..1", ["engine", "model"])
+
+
+def error_body(message: str, type_: str = "invalid_request_error", param: str | None = None, code: str | None = None):
+    return {"error": {"message": message, "type": type_, "param": param, "code": code}}
+
+
+class C2CompletionRequest(BaseModel):
+    # C2 §completions request fields = contract; unknown fields rejected (subset semantics)
+    model_config = ConfigDict(extra="forbid")
+    model: str
+    prompt: str
+    max_tokens: int = Field(default=16, ge=1, le=256)
+    temperature: float = Field(default=1.0, ge=0.0, le=2.0)
+    top_p: float = Field(default=1.0, ge=0.0, le=1.0)
+    seed: int | None = None
 
 
 def get_global_state() -> FrontendManager:
@@ -87,7 +126,7 @@ class ModelCard(BaseModel):
     id: str
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
-    owned_by: str = "mini-sglang"
+    owned_by: str = "nano-ai-infra-stack"  # C2 §models (t4d alignment; upstream was "mini-sglang")
     root: str
 
 
@@ -105,6 +144,22 @@ class FrontendManager:
     initialized: bool = False
     ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)
     event_map: Dict[int, asyncio.Event] = field(default_factory=dict)
+    # latest scheduler gauge snapshot (GaugeReply stream, t4 §3 T4d)
+    gauges: Dict[str, float] = field(
+        default_factory=lambda: {"queue_depth": 0.0, "running_batch": 0.0, "kv_utilization": 0.0}
+    )
+    # C2 helpers: tokenizer for prompt-length validation, sidecar config for max context
+    tokenizer: Any = None
+    max_position: int = 0
+
+    @property
+    def model_name(self) -> str:
+        return os.path.basename(self.config.model_path.rstrip("/")) or "nano-model"
+
+    def update_gauges(self, msg: GaugeReply) -> None:
+        self.gauges["queue_depth"] = msg.queue_depth
+        self.gauges["running_batch"] = msg.running_batch
+        self.gauges["kv_utilization"] = msg.kv_utilization
 
     def new_user(self) -> int:
         uid = self.uid_counter
@@ -116,6 +171,9 @@ class FrontendManager:
     async def listen(self):
         while True:
             msg = await self.recv_tokenizer.get()
+            if isinstance(msg, GaugeReply):
+                self.update_gauges(msg)
+                continue
             for msg in _unwrap_msg(msg):
                 if msg.uid not in self.ack_map:
                     continue
@@ -133,21 +191,25 @@ class FrontendManager:
 
     async def wait_for_ack(self, uid: int):
         event = self.event_map[uid]
+        # cleanup in finally: non-streaming consumers break ON the finished yield,
+        # so the generator is finalized at that yield point (GeneratorExit) and the
+        # post-loop dels would never run — leaking ack_map entries and eventually
+        # poisoning the 503 admission counter (t4d E-C1 incident)
+        try:
+            while True:
+                await event.wait()
+                event.clear()
 
-        while True:
-            await event.wait()
-            event.clear()
-
-            pending = self.ack_map[uid]
-            self.ack_map[uid] = []
-            ack = None
-            for ack in pending:
-                yield ack
-            if ack and ack.finished:
-                break
-
-        del self.ack_map[uid]
-        del self.event_map[uid]
+                pending = self.ack_map[uid]
+                self.ack_map[uid] = []
+                ack = None
+                for ack in pending:
+                    yield ack
+                if ack and ack.finished:
+                    break
+        finally:
+            self.ack_map.pop(uid, None)
+            self.event_map.pop(uid, None)
 
     async def stream_generate(self, uid: int):
         async for ack in self.wait_for_ack(uid):
@@ -313,7 +375,123 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
 @app.get("/v1/models")
 async def available_models():
     state = get_global_state()
-    return ModelList(data=[ModelCard(id=state.config.model_path, root=state.config.model_path)])
+    return ModelList(data=[ModelCard(id=state.model_name, root=state.config.model_path)])
+
+
+# ---------------------------------------------------------------------------
+# C2 server contract (doc/contracts/server_api.md): /v1/completions /health
+# /metrics added by t4d; upstream endpoints above kept untouched as references.
+# ---------------------------------------------------------------------------
+
+
+@app.exception_handler(RequestValidationError)
+async def c2_validation_error_handler(request, exc: RequestValidationError):
+    REQUEST_TOTAL.labels(ENGINE_LABEL, get_global_state().model_name, "error").inc()
+    first = exc.errors()[0]
+    loc = ".".join(str(x) for x in first["loc"])
+    return JSONResponse(status_code=400, content=error_body(f"{loc}: {first['msg']}", param=loc or None))
+
+
+@app.post("/v1/completions")
+async def c2_completions(req: C2CompletionRequest):
+    state = get_global_state()
+    model = state.model_name
+    if req.model != model:
+        REQUEST_TOTAL.labels(ENGINE_LABEL, model, "error").inc()
+        return JSONResponse(
+            status_code=404,
+            content=error_body(f"The model `{req.model}` does not exist", code="model_not_found"),
+        )
+    # 503 admission control: in-flight requests >= max_running_req (C2 §503, autoscaler signal)
+    if len(state.ack_map) >= state.config.max_running_req:
+        REQUEST_TOTAL.labels(ENGINE_LABEL, model, "error").inc()
+        return JSONResponse(
+            status_code=503,
+            content=error_body("engine overloaded, retry later", type_="server_error", code="engine_overloaded"),
+        )
+    try:
+        prompt_ids = state.tokenizer.encode(req.prompt)
+    except ValueError as e:
+        REQUEST_TOTAL.labels(ENGINE_LABEL, model, "error").inc()
+        return JSONResponse(
+            status_code=400,
+            content=error_body(f"prompt encoding failed: {e}", param="prompt"),
+        )
+    if len(prompt_ids) + req.max_tokens > state.max_position:
+        REQUEST_TOTAL.labels(ENGINE_LABEL, model, "error").inc()
+        return JSONResponse(
+            status_code=422,
+            content=error_body(
+                f"This model's maximum context length is {state.max_position} tokens, "
+                f"however you requested {len(prompt_ids) + req.max_tokens} tokens "
+                f"({len(prompt_ids)} in the prompt, {req.max_tokens} for the completion)",
+                code="context_length_exceeded",
+            ),
+        )
+    uid = state.new_user()
+    enqueue_t = perf_counter()
+    await state.send_one(
+        TokenizeMsg(
+            uid=uid,
+            text=req.prompt,
+            sampling_params=SamplingParams(
+                max_tokens=req.max_tokens,
+                temperature=req.temperature,
+                top_p=req.top_p,
+                seed=req.seed,
+            ),
+        )
+    )
+    first_t: float | None = None
+    text = ""
+    prompt_tokens = completion_tokens = 0
+    async for ack in state.wait_for_ack(uid):
+        if first_t is None:
+            first_t = perf_counter()
+        text += ack.incremental_output
+        prompt_tokens, completion_tokens = ack.prompt_tokens, ack.completion_tokens
+        if ack.finished:
+            break
+    finish_t = perf_counter()
+    TTFT.labels(ENGINE_LABEL, model).observe(first_t - enqueue_t)
+    if completion_tokens > 1:
+        TPOT.labels(ENGINE_LABEL, model).observe((finish_t - first_t) / (completion_tokens - 1))
+    PROMPT_TOKENS.labels(ENGINE_LABEL, model).inc(prompt_tokens)
+    COMPLETION_TOKENS.labels(ENGINE_LABEL, model).inc(completion_tokens)
+    REQUEST_TOTAL.labels(ENGINE_LABEL, model, "ok").inc()
+    return {
+        "id": f"cmpl-{uuid.uuid4().hex}",
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": model,
+        # char model has no EOS (t4 §6.4) -> "length" is the reachable branch; "stop" kept per contract
+        "choices": [{
+            "index": 0,
+            "text": text,
+            "finish_reason": "length" if completion_tokens >= req.max_tokens else "stop",
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+
+
+@app.get("/health")
+async def c2_health():
+    return {"status": "ok"}
+
+
+@app.get("/metrics")
+async def c2_metrics():
+    # gauge semantics = latest snapshot from the GaugeReply stream (t4 §3 T4d)
+    state = get_global_state()
+    engine, model = ENGINE_LABEL, state.model_name
+    QUEUE_DEPTH.labels(engine, model).set(state.gauges["queue_depth"])
+    RUNNING_BATCH.labels(engine, model).set(state.gauges["running_batch"])
+    KV_UTIL.labels(engine, model).set(state.gauges["kv_utilization"])
+    return Response(content=generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
 
 async def shell_completion(req: OpenAICompletionRequest):
@@ -440,6 +618,11 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
             create=config.frontend_create_tokenizer_link,
             encoder=BaseTokenizerMsg.encoder,
         ),
+    )
+    # C2 helpers: prompt-length validation + sidecar max context (t4 §3 T4d)
+    _GLOBAL_STATE.tokenizer = load_tokenizer(config.model_path)
+    _GLOBAL_STATE.max_position = int(
+        getattr(cached_load_hf_config(config.model_path), "max_position_embeddings", 2048)
     )
 
     # start the backend here
