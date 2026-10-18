@@ -40,7 +40,11 @@ def scheduler(model_dir):
         model_path=model_dir,
         tp_info=DistributedInfo(0, 1),
         dtype=torch.bfloat16,
-        # fi's prefill templates reject head_dim=32 (t4 §6.12); sdpa = reference backend
+        # fi's prefill templates reject head_dim=32 — flashinfer fa2 batch prefill
+        # requires NUM_MMA_D_VO = head_dim/16 >= 4, else IsInvalid() raises
+        # "Invalid configuration" at the first prefill plan (flashinfer 0.7.0.post1
+        # prefill.cuh:417,2899; verified in stack issue #23, t4 design §6 item 15).
+        # sdpa = reference backend
         attention_backend="sdpa",
         cuda_graph_bs=[],  # eager: determinism over speed (T3 enforce_eager analog)
         # GPU shared with the T3 nano-vllm pod (VLLM::EngineCore ~3.4GB of 4GB):
